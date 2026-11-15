@@ -146,6 +146,20 @@ class HTTPTests(unittest.TestCase):
 
 
 class EndToEndTests(unittest.TestCase):
+    def test_terminal_entry_prints_all_predictions_without_web_server(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "train.py"), "--rounds", "2", "--threads", "1", "--runtime", temp],
+                cwd=ROOT, capture_output=True, text=True, timeout=90)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            predictions = [line for line in result.stdout.splitlines() if "预测概率" in line and "样本 " in line]
+            self.assertEqual(len(predictions), 80)
+            self.assertIn("最终准确率", result.stdout)
+            self.assertIn("predictions.csv", result.stdout)
+            paths = list(Path(temp).glob("*/predictions.json"))
+            self.assertEqual(len(paths), 1)
+            self.assertEqual(len(read_json(paths[0])), 80)
+
     def test_three_real_processes_train_export_and_predict_every_sample(self):
         with tempfile.TemporaryDirectory() as temp:
             control = ControlPlane(temp, "local", threads=1)
