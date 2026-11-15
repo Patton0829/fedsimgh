@@ -34,11 +34,14 @@ import uuid
 from pathlib import Path
 from faultdemo.io import atomic_json
 
-config = {"mode": "slurm", "rounds": int(os.environ.get("FEDSIMGH_ROUNDS", "300")),
+config = {"mode": "slurm", "transport": os.environ.get("FEDSIMGH_TRANSPORT", "file"),
+          "rounds": int(os.environ.get("FEDSIMGH_ROUNDS", "300")),
           "epochs": int(os.environ.get("FEDSIMGH_EPOCHS", "1")),
           "lr": float(os.environ.get("FEDSIMGH_LR", "0.03")),
           "tau": float(os.environ.get("FEDSIMGH_TAU", "3")),
           "history_lambda": float(os.environ.get("FEDSIMGH_HISTORY_LAMBDA", "0.6"))}
+if config["transport"] not in ("file", "tcp"):
+    raise SystemExit("FEDSIMGH_TRANSPORT must be file or tcp")
 limits = {"rounds": (1, 1000), "epochs": (1, 3), "lr": (.0001, .2),
           "tau": (.1, 10), "history_lambda": (0, .99)}
 for name, (low, high) in limits.items():
@@ -54,13 +57,22 @@ atomic_json(run / "submission.json", {"mode": "slurm", "job_id": os.environ.get(
 print(run)
 PY
 )"
-echo "FedSimGH | job=${SLURM_JOB_ID} | shared project=$DEMO_PROJECT"
+echo "FedSimGH | job=${SLURM_JOB_ID} | transport=${FEDSIMGH_TRANSPORT:-file} | project=$DEMO_PROJECT"
 echo "Output directory: $DEMO_RUN_DIR"
+if [[ "${FEDSIMGH_TRANSPORT:-file}" == tcp ]]; then
+  export DEMO_PROJECT DEMO_PYTHON DEMO_RUN_DIR
+  FEDSIMGH_WORKER_CONFIG="$("$DEMO_PYTHON" -c 'import pathlib,sys; print((pathlib.Path(sys.argv[1])/"config.json").read_text())' "$DEMO_RUN_DIR")"
+  export FEDSIMGH_WORKER_CONFIG
+  # Rank 0 results are stored locally on the batch node. No shared mount is
+  # required by this launcher; copying results to controller is a separate step.
+  bash "$DEMO_PROJECT/slurm/tcp-tasks.sh"
+else
 # Stream all ranks to the enclosing Slurm job log so the existing system log
 # viewer can display training and per-sample diagnosis without another web server.
 srun --kill-on-bad-exit=1 --cpu-bind=cores --label \
   "$DEMO_PYTHON" -u -m faultdemo.worker --run-dir "$DEMO_RUN_DIR" \
   2>&1 | tee "$DEMO_RUN_DIR/console.log"
+fi
 
 "$DEMO_PYTHON" - "$DEMO_RUN_DIR" <<'PY'
 import sys

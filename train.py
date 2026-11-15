@@ -33,6 +33,8 @@ def finish_local_workers(control, run_id):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="终端运行三客户端 CPU 联邦训练，并输出每条信号的故障类别")
     parser.add_argument("--mode", choices=["local", "slurm"], default="local")
+    parser.add_argument("--transport", choices=["file", "tcp"], default="file", help="通信方式，默认保留 file")
+    parser.add_argument("--tcp-timeout", type=float, default=120, help="TCP 握手/每条消息超时秒数")
     parser.add_argument("--rounds", type=int, default=300, help="全局训练轮次，1–1000，默认 300")
     parser.add_argument("--epochs", type=int, default=1, help="每客户端每轮本地 epoch，1–3")
     parser.add_argument("--threads", type=int, choices=range(1, 9), default=1, help="每客户端 CPU 线程数")
@@ -42,7 +44,7 @@ def main(argv=None):
     parser.add_argument("--runtime", type=Path, default=ROOT / "runtime" / "terminal",
                         help="输出目录；默认与网页任务分开存储")
     args = parser.parse_args(argv)
-    control = ControlPlane(args.runtime, args.mode, args.threads)
+    control = ControlPlane(args.runtime, args.mode, args.threads, args.transport, args.tcp_timeout)
     run_id = None
     try:
         options = {key: getattr(args, key) for key in ["rounds", "epochs", "lr", "tau", "history_lambda"]}
@@ -50,13 +52,15 @@ def main(argv=None):
         run = control.directory(run_id)
         print("FedSimGHHistNoSize · 三客户端 · CPU · 终端模式", flush=True)
         print(f"全局轮次={args.rounds}，本地 epochs={args.epochs}，每客户端线程={args.threads}", flush=True)
+        print(f"通信方式：{args.transport.upper()}", flush=True)
         print("数据：288 条训练信号，80 条测试信号；类别：正常、内圈、外圈、滚动体故障。", flush=True)
         print(f"输出目录：{run}", flush=True)
         if args.mode == "slurm":
             submission = control.snapshot(run_id)["submission"]
             print(f"Slurm 作业号：{submission['job_id']}；等待三个计算节点。", flush=True)
         else:
-            print("正在启动三个本地 CPU 客户端，无需网页、端口或 Slurm。", flush=True)
+            print("正在启动三个本地 CPU 客户端，无需网页或 Slurm。" +
+                  ("TCP 使用自动选择的本机回环端口。" if args.transport == "tcp" else "文件模式无需端口。"), flush=True)
         offset = 0
         scheduler = None
         while True:

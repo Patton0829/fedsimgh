@@ -19,6 +19,12 @@ echo "Job=${SLURM_JOB_ID} Nodes=${SLURM_JOB_NODELIST} Tasks=${SLURM_NTASKS}"
 echo "Shared working directory: ${PWD}"
 test "${SLURM_NTASKS}" -eq 3
 test "${SLURM_JOB_NUM_NODES}" -eq 3
+if [[ -n "${FEDSIMGH_WORKER_CONFIG:-}" ]]; then
+  # Auto-submit control-plane mode: only rank 0 results must be visible to the
+  # controller. Rank 1/2 never read that directory; all updates travel via TCP.
+  export DEMO_PROJECT="$PWD" DEMO_PYTHON DEMO_RUN_DIR
+  exec bash "$DEMO_PROJECT/slurm/tcp-tasks.sh"
+fi
 # One process on each of the three nodes. Rank 0 also performs aggregation.
 # No GPU, torch.distributed port, ssh daemon or fourth compute node is required.
 srun --kill-on-bad-exit=1 --cpu-bind=cores --output="${DEMO_RUN_DIR}/rank-%t.log" \

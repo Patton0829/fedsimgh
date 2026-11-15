@@ -11,7 +11,8 @@ from pathlib import Path
 import torch
 
 from .core import HistoricalCoordinator, LABELS, TinySignalCNN, apply_delta, evaluate, load_arrays, local_update
-from .io import atomic_json, check_stop, read_json, wait_for
+from .io import atomic_json, check_stop, read_json
+from .transport import FileTransport, TCPTransport
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -29,23 +30,39 @@ def emit(run, kind, message, **fields):
     print(message, flush=True)
 
 
-def execute(run, rank, threads):
+def execute(run, rank, threads, supplied_config=None):
     torch.set_num_threads(threads)
     torch.set_num_interop_threads(1)
     torch.manual_seed(42)
-    config = read_json(run / "config.json")
+    run.mkdir(parents=True, exist_ok=True)
+    config = supplied_config if supplied_config is not None else read_json(run / "config.json")
+    if supplied_config is not None:
+        atomic_json(run / "config.json", config)
+        (run / "config.json").chmod(0o600)
     check_stop(run)
     started = time.monotonic()
     model = TinySignalCNN().cpu()
     x, y = load_arrays(ROOT / "data" / f"client_{rank}.npz")
-    atomic_json(run / f"node-{rank}.json", {"rank": rank, "hostname": socket.gethostname(),
-                                           "threads": threads, "samples": len(y), "pid": os.getpid()})
+    node = {"rank": rank, "hostname": socket.gethostname(), "threads": threads,
+            "samples": len(y), "pid": os.getpid()}
+    atomic_json(run / f"node-{rank}.json", node)
     print(f"rank={rank} host={socket.gethostname()} CPU threads={threads} train={len(y)}", flush=True)
+    kind = config.get("transport", "file")
+    if kind not in ("file", "tcp"):
+        raise ValueError("Unknown transport")
+    transport = (TCPTransport if kind == "tcp" else FileTransport)(run, rank, config, model, node, save_torch)
+    try:
+        train(run, rank, config, model, x, y, started, transport)
+    finally:
+        transport.close()
+
+
+def train(run, rank, config, model, x, y, started, transport):
     rounds = config["rounds"]
     if rank == 0:
-        for node in range(3):
-            wait_for(run / f"node-{node}.json", run)
-        nodes = [read_json(run / f"node-{node}.json") for node in range(3)]
+        nodes = transport.nodes
+        for info in nodes:
+            atomic_json(run / f"node-{info['rank']}.json", info)
         if config["mode"] == "slurm" and len({n["hostname"] for n in nodes}) != 3:
             raise RuntimeError("Slurm 模式必须启动在三个不同节点，请检查 --ntasks-per-node=1")
         coordinator = HistoricalCoordinator(config["tau"], config["history_lambda"])
@@ -55,27 +72,21 @@ def execute(run, rank, threads):
                  "metrics": [], "elapsed": 0, "predictions": 0}
         atomic_json(run / "state.json", state)
         emit(run, "start", "三客户端已就绪，CPU 联邦训练开始；节点 0 同时负责聚合。")
-        save_torch(run / "global-000.pt", model.state_dict())
+        emit(run, "transport", f"通信方式：{config.get('transport', 'file').upper()}；每轮按节点 0、1、2 顺序聚合。")
     for step in range(1, rounds + 1):
-        checkpoint = run / f"global-{step - 1:03d}.pt"
-        wait_for(checkpoint, run)
-        model.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True))
+        transport.load_global(model, step)
+        baseline = {key: value.clone() for key, value in model.state_dict().items()} if rank == 0 else None
         delta, loss = local_update(model, x, y, config["epochs"], config["lr"], 16,
                                    42 + step * 3 + rank, lambda: check_stop(run))
-        save_torch(run / f"delta-{step:03d}-{rank}.pt", {"delta": delta, "loss": loss})
         print(f"round={step} rank={rank} loss={loss:.5f}", flush=True)
+        uploads = transport.exchange(step, delta, loss)
         if rank != 0:
             continue
-        uploads = []
-        for node in range(3):
-            path = run / f"delta-{step:03d}-{node}.pt"
-            wait_for(path, run)
-            upload = torch.load(path, map_location="cpu", weights_only=True)
-            uploads.append(upload)
+        for node, upload in enumerate(uploads):
             emit(run, "client", f"第 {step:02d} 轮 · 节点 {node} 本地训练完成，loss={upload['loss']:.4f}",
                  round=step, client=node, loss=upload["loss"])
         # Reset to the pre-round global model before applying weighted client deltas.
-        model.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True))
+        model.load_state_dict(baseline)
         update, detail = coordinator.aggregate([u["delta"] for u in uploads])
         apply_delta(model, update)
         metrics, _ = evaluate(model, test_x, test_y)
@@ -88,15 +99,19 @@ def execute(run, rank, threads):
         emit(run, "metric", f"第 {step:02d} 轮 · 演示测试集准确率 {metrics['accuracy']:.1%} · Macro-F1 {metrics['macro_f1']:.3f}",
              **record)
         # Save the last round, rather than selecting against the demonstration test set.
-        save_torch(run / f"global-{step:03d}.pt", model.state_dict())
+        transport.publish(model, step)
         state.update(round=step, metrics=trajectory, elapsed=round(time.monotonic() - started, 2))
         atomic_json(run / "state.json", state)
+        # Existing system curve endpoints expect zero-based epoch JSON objects.
+        atomic_json(run / "acc_data.json", {str(i): row["accuracy"] for i, row in enumerate(trajectory)})
+        atomic_json(run / "loss_data.json", {str(i): row["loss"] for i, row in enumerate(trajectory)})
+    transport.close(success=True)
     if rank != 0:
         return
     check_stop(run)
     save_torch(run / "model.pt", {"state_dict": model.state_dict(), "labels": LABELS,
                                  "window_size": 2048, "algorithm": "FedSimGHHistNoSize",
-                                 "rounds": rounds, "config": config})
+                                 "rounds": rounds, "config": {k: v for k, v in config.items() if k != "tcp_token"}})
     state["status"] = "predicting"
     atomic_json(run / "state.json", state)
     emit(run, "predict_start", f"训练完成，使用最后一轮模型逐条诊断 {len(test_y)} 条独立测试样本。")
@@ -130,12 +145,15 @@ def main():
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--rank", type=int, default=int(os.environ.get("SLURM_PROCID", "0")))
     parser.add_argument("--threads", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", "2")))
+    parser.add_argument("--config-env", action="store_true",
+                        help="Read FEDSIMGH_WORKER_CONFIG; each node can use a private output directory")
     args = parser.parse_args()
     if args.rank not in range(3):
         parser.error("Expected exactly three ranks: 0, 1, 2")
     run = args.run_dir.resolve()
     try:
-        execute(run, args.rank, args.threads)
+        supplied = json.loads(os.environ["FEDSIMGH_WORKER_CONFIG"]) if args.config_env else None
+        execute(run, args.rank, args.threads, supplied)
     except InterruptedError:
         if args.rank == 0:
             state = read_json(run / "state.json", {})

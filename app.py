@@ -2,7 +2,7 @@
 """Standard-library control plane. Training/inference always run in worker tasks.
 
 No PyTorch is imported by this web process. Slurm mode submits three compute
-nodes and exchanges artifacts over their shared filesystem.
+nodes; updates use either shared files or rank-0 TCP connections.
 """
 import argparse
 import json
@@ -11,6 +11,8 @@ import mimetypes
 import os
 import re
 import shutil
+import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -28,11 +30,16 @@ TERMINAL = {"completed", "failed", "cancelled"}
 
 
 class ControlPlane:
-    def __init__(self, runtime, mode="slurm", threads=2):
+    def __init__(self, runtime, mode="slurm", threads=2, transport="file", tcp_timeout=120):
+        if transport not in ("file", "tcp"):
+            raise ValueError("transport 必须为 file 或 tcp")
+        if not math.isfinite(tcp_timeout) or not 1 <= tcp_timeout <= 3600:
+            raise ValueError("tcp_timeout 必须为 1–3600 秒")
         self.runtime = Path(runtime).resolve()
         self.runtime.mkdir(parents=True, exist_ok=True)
         self.mode = mode
         self.threads = threads
+        self.transport, self.tcp_timeout = transport, tcp_timeout
         self.lock = threading.RLock()
         self.children = {}
         self.poll_cache = {}
@@ -51,7 +58,7 @@ class ControlPlane:
 
     def info(self):
         manifest = read_json(ROOT / "data/manifest.json")
-        return {"mode": self.mode, "threads": self.threads, "dataset": manifest,
+        return {"mode": self.mode, "threads": self.threads, "transport": self.transport, "dataset": manifest,
                 "slurm_available": shutil.which("sbatch") is not None,
                 "samples": read_json(ROOT / "data/samples.json", [])}
 
@@ -64,12 +71,21 @@ class ControlPlane:
             error = read_json(errors[0])
             state.update(status="failed", message=f"节点 {error['rank']} 失败：{error['error']}")
             atomic_json(run / "state.json", state)
+            if self.transport == "tcp":
+                (run / "STOP").touch()
+                for process in self.children.get(run.name, []):
+                    if process.poll() is None:
+                        process.terminate()
             return state
         processes = self.children.get(run.name, [])
         if any(p.poll() is not None and p.returncode != 0 for p in processes):
             state.update(status="failed", message="本地 worker 异常退出，请下载节点日志。")
             (run / "STOP").touch()
             atomic_json(run / "state.json", state)
+            if self.transport == "tcp":
+                for process in processes:
+                    if process.poll() is None:
+                        process.terminate()
         if self.mode == "slurm":
             meta = read_json(run / "submission.json", {})
             job_id = meta.get("job_id")
@@ -116,7 +132,8 @@ class ControlPlane:
                             break
                         events.append(json.loads(line))
                     next_offset = stream.tell()
-            return {"run_id": run.name, "state": state, "config": read_json(run / "config.json"),
+            public_config = {k: v for k, v in read_json(run / "config.json").items() if k != "tcp_token"}
+            return {"run_id": run.name, "state": state, "config": public_config,
                     "submission": read_json(run / "submission.json", {}), "events": events,
                     "offset": next_offset, "predictions": read_json(run / "predictions.json", [])}
 
@@ -129,7 +146,7 @@ class ControlPlane:
             if self.mode == "slurm" and not shutil.which("sbatch"):
                 raise ValueError("未找到 sbatch。请在可提交 Slurm 作业的主机启动，或用 --mode local 本地验证。")
             limits = {"rounds": (1, 1000, 300), "epochs": (1, 3, 1)}
-            config = {"mode": self.mode}
+            config = {"mode": self.mode, "transport": self.transport}
             for key, (low, high, default) in limits.items():
                 value = options.get(key, default)
                 if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
@@ -142,9 +159,19 @@ class ControlPlane:
                     raise ValueError(f"{key} 超出范围 {low}–{high}")
                 config[key] = float(value)
             run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
+            if self.transport == "tcp":
+                config.update(tcp_run_id=run_id, tcp_token=secrets.token_hex(32),
+                              tcp_timeout=self.tcp_timeout)
+                if self.mode == "local":
+                    # Probe an ephemeral loopback port. A bind race fails explicitly.
+                    with socket.socket() as probe:
+                        probe.bind(("127.0.0.1", 0))
+                        port = probe.getsockname()[1]
+                    config.update(tcp_host="127.0.0.1", tcp_bind="127.0.0.1", tcp_port=port)
             run = self.runtime / run_id
             run.mkdir()
             atomic_json(run / "config.json", config)
+            (run / "config.json").chmod(0o600)
             atomic_json(run / "state.json", {"status": "queued", "round": 0, "rounds": config["rounds"],
                                              "metrics": [], "nodes": [], "predictions": 0})
             try:
@@ -153,11 +180,16 @@ class ControlPlane:
                     self.children[run_id] = processes
                     env = {**os.environ, "OMP_NUM_THREADS": str(self.threads), "MKL_NUM_THREADS": str(self.threads),
                            "OPENBLAS_NUM_THREADS": str(self.threads)}
+                    env.pop("FEDSIMGH_WORKER_CONFIG", None)
+                    if self.transport == "tcp":
+                        env["FEDSIMGH_WORKER_CONFIG"] = json.dumps(config)
                     for rank in range(3):
+                        worker_run = run if rank == 0 or self.transport == "file" else run / f"client-{rank}"
+                        extra = ["--config-env"] if self.transport == "tcp" else []
                         with (run / f"rank-{rank}.log").open("wb") as log:
                             processes.append(subprocess.Popen(
-                                [sys.executable, "-u", "-m", "faultdemo.worker", "--run-dir", str(run),
-                                 "--rank", str(rank), "--threads", str(self.threads)], cwd=ROOT,
+                                [sys.executable, "-u", "-m", "faultdemo.worker", "--run-dir", str(worker_run),
+                                 "--rank", str(rank), "--threads", str(self.threads), *extra], cwd=ROOT,
                                 stdout=log, stderr=subprocess.STDOUT, env=env))
                     atomic_json(run / "submission.json", {"mode": "local", "pids": [p.pid for p in processes]})
                 else:
@@ -168,7 +200,11 @@ class ControlPlane:
                         if os.environ.get(variable):
                             command += [flag, os.environ[variable]]
                     command += [str(ROOT / "slurm/train.sbatch"), str(run), sys.executable]
-                    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=30)
+                    env = {**os.environ}
+                    env.pop("FEDSIMGH_WORKER_CONFIG", None)
+                    if self.transport == "tcp":
+                        env["FEDSIMGH_WORKER_CONFIG"] = json.dumps(config)
+                    result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
                     if result.returncode:
                         raise RuntimeError(f"sbatch 提交失败：{result.stderr.strip()}")
                     job_id = result.stdout.strip().split(";")[0]
@@ -188,6 +224,11 @@ class ControlPlane:
             if state.get("status") in TERMINAL:
                 return {"status": state["status"]}
             (run / "STOP").touch()
+            if self.transport == "tcp":
+                # TCP clients have private directories, so stop their processes too.
+                for process in self.children.get(run_id, []):
+                    if process.poll() is None:
+                        process.terminate()
             meta = read_json(run / "submission.json", {})
             if meta.get("job_id"):
                 result = subprocess.run(["scancel", meta["job_id"]], capture_output=True, text=True, timeout=15)
@@ -287,9 +328,11 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--mode", choices=["slurm", "local"], default="slurm")
     parser.add_argument("--threads", type=int, choices=range(1, 9), default=2)
+    parser.add_argument("--transport", choices=["file", "tcp"], default="file")
+    parser.add_argument("--tcp-timeout", type=float, default=120)
     parser.add_argument("--runtime", type=Path, default=ROOT / "runtime")
     args = parser.parse_args()
-    control = ControlPlane(args.runtime, args.mode, args.threads)
+    control = ControlPlane(args.runtime, args.mode, args.threads, args.transport, args.tcp_timeout)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(control))
     print(f"FaultDiag CPU demo: http://{args.host}:{args.port} · mode={args.mode} · 3 clients", flush=True)
     try:

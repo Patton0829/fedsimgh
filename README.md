@@ -33,7 +33,60 @@ cd /Users/patton/system/fedsimgh
 
 终端、网页和 system 作业脚本均以 300 轮为默认值。Linux 服务器应在其实际共享目录重新运行 `scripts/setup.sh` 创建本机 Python 环境，不能把 macOS 的 `.venv` 直接用于 Linux。
 
-## 三节点部署
+## TCP Socket 通信（新增，适合各计算节点独立目录）
+
+与 communicate 类似，现在可以用 TCP 交换模型，但保留 FedSimGH 的原有算法：节点 0 同时本地训练、成对冲突投影、历史相似度加权聚合，节点 1/2 各自在本机训练。每轮下发全局参数、上传参数差 `Δ_i` 和本地 loss，**不传送原始训练样本**。聚合按客户端编号固定顺序执行，通信先后不会改变投影顺序或 EMA。无需第四个训练节点，也不需要在中心云部署模型服务。
+
+本地终端验证（自动选择回环 TCP 端口，三个独立进程、独立客户端输出目录）：
+
+```bash
+cd /Users/patton/system/fedsimgh
+.venv/bin/python -u train.py --transport tcp --rounds 300 --threads 1
+```
+
+`--transport file` 为保留的原有文件模式，也是默认值；旧命令仍可使用。独立网页可以用 `app.py --mode local --transport tcp --port 8001`，避免与 system 已有的 Aider 8000 端口冲突。
+
+### 服务器三节点：不依赖共享存储
+
+1. 在 **每个计算节点** 分别把相同版本仓库部署到相同的绝对路径，例如 `/home/fedsimgh`，并分别执行 `bash scripts/setup.sh` 创建 Linux 环境。代码、三个训练分片和测试集随仓库提供（约 2.9 MiB）；运行中各客户端只加载自己的训练分片，只有节点 0 加载测试集。同名路径不需要是共享挂载。
+2. Slurm 分配三个不同节点，每节点一个进程。第一个分配节点为 rank 0，主机名由 `scontrol show hostnames` 发现；默认监听 `20000 + SLURM_JOB_ID % 30000`。只允许另外两个计算节点通过内网访问该端口，不要开放公网端口。端口冲突时任务明确失败，可设置 `FEDSIMGH_TCP_PORT` 换端口。
+3. 在已有的三节点 Slurm 作业内使用以下启动片段。**不能在分配内部再调用 `train.py --mode slurm`，否则会重复申请资源。**
+
+```bash
+# 放在系统现有 sbatch 脚本中，或在 salloc 分配到三个节点后运行。
+# 外层必须包含 --nodes=3 --ntasks=3 --ntasks-per-node=1。
+export FEDSIMGH_PROJECT=/home/fedsimgh
+export FEDSIMGH_PYTHON=/home/fedsimgh/.venv/bin/python
+export FEDSIMGH_TRANSPORT=tcp
+export FEDSIMGH_OUTPUT=/home/fedsimgh/runtime/system
+export FEDSIMGH_ROUNDS=300
+# 可选：export FEDSIMGH_TCP_PORT=29501
+# 可选：export FEDSIMGH_TCP_TIMEOUT=120
+exec bash "$FEDSIMGH_PROJECT/slurm/system.sbatch"
+```
+
+如果只是独立提交一次任务，在能使用 sbatch 的主机执行：
+
+```bash
+sbatch --partition=debug --export=ALL,FEDSIMGH_PROJECT=/home/fedsimgh,FEDSIMGH_TRANSPORT=tcp \
+  /home/fedsimgh/slurm/system.sbatch
+```
+
+此命令由 batch 节点初始化任务，通过 srun 的环境变量分发运行配置；节点 1/2 使用各自 `SLURM_TMPDIR`（无则 `/tmp`）下的临时目录，**不会读写节点 0 的模型文件或结果目录**。节点 0 在 `FEDSIMGH_OUTPUT/<运行编号>/` 保存模型、日志、曲线、预测；其他节点的微小诊断文件由集群临时目录策略回收，`/tmp` 下的文件不会由本程序自动删除。所有节点输出通过 srun 汇入外层 Slurm 标准日志，包含训练和逐样本诊断。
+
+注意区分 **模型通信** 与 **结果回传**：没有共享存储时，完整结果仅在第一个计算节点的上述目录；必须再将它们复制/同步回 controller 的作业目录，中心云才可读取模型与曲线。现有 Aider 能否看到 Slurm 日志同样取决于日志文件可见性，TCP 本身不会让本地文件自动共享。当前改动没有修改 system 的菜单、算法选择器或后端结果回传链路，也没有操作数据库或部署真实集群。
+
+`train.py --mode slurm --transport tcp` / `app.py --mode slurm --transport tcp` 也可自动提交，但它们的控制进程会从结果目录读取进度，**因此要求 controller 与 rank 0 之间结果目录可见**；只有节点 1/2 可以完全不共享该目录。完全无共享存储时，应采用上面的 `system.sbatch` 入口，并安排结果回传。
+
+### 协议与失败行为
+
+- 持久 TCP 连接、长度前缀分帧，支持网络拆包/粘包；有消息大小、参数长度与 NaN/Inf 校验；网络传输不反序列化 pickle。
+- 每次运行有随机 token、任务编号、协议版本、轮次与配置摘要，拒绝错误 token、重复客户端、配置不一致和过期更新。token 不进入前端状态接口或模型导出文件。
+- 默认握手/每条消息等待上限 120 秒；使用 `--tcp-timeout`（本地/自动提交）或 `FEDSIMGH_TCP_TIMEOUT`（Slurm）修改。连接尚未就绪时会有限重试；训练中断线、超时则失败，不自动跳过节点或重复聚合旧结果。Slurm 使用 `--kill-on-bad-exit=1` 终止同一作业中的其他进程。本地停止与 `Ctrl+C` 会终止本次三个进程。
+- token 握手不是 TLS，不提供链路加密或抵御恶意内网节点的保证，只用于受信计算内网。不要在 shell 使用 `set -x` 打印带 token 的环境变量，不要将 `config.json` 公开下载。
+- TCP 替换通信而非算法，不保证提高准确率，也不自动恢复中断轮次。固定种子、相同数据/软件/线程条件下，本地测试逐项对照两个模式的模型、逐轮指标及 80 条预测。
+
+## 原有文件通信三节点部署（保留）
 
 前提：Linux、推荐 Python 3.11、三个 CPU 计算节点；**仓库、虚拟环境和 `runtime/` 必须位于所有节点相同路径的共享目录**。Web 进程运行在允许长期启动轻量服务且可以调用 `sbatch/squeue/scancel` 的主机上。计算由 Slurm 作业完成，Web 进程不加载 PyTorch、不在登录节点训练。
 
@@ -112,7 +165,7 @@ Slurm 脚本在 [`slurm/train.sbatch`](slurm/train.sbatch)：固定 `3 nodes × 
 
 ## 没有 Slurm 时本地验证
 
-直接在终端训练并逐条输出故障诊断（不启动网页、不占用端口）：
+直接在终端训练并逐条输出故障诊断（文件模式不启动网页、不占用端口）：
 
 ```bash
 .venv/bin/python -u train.py --rounds 300 --threads 1
@@ -128,7 +181,7 @@ Slurm 脚本在 [`slurm/train.sbatch`](slurm/train.sbatch)：固定 `3 nodes × 
 .venv/bin/python app.py --mode local --threads 1 --port 8000
 ```
 
-若提示 `Address already in use`，说明端口已被占用，可改用 `--port 8001`；终端入口没有端口要求。
+若提示 `Address already in use`，说明网页端口已被占用，可改用 `--port 8001`；终端文件模式无需端口，TCP 模式会自动选择本地回环端口。
 
 这个模式启动三个独立 CPU 进程，使用与 Slurm 完全相同的 worker、聚合器和文件协议；仅用于验证，页面会标明「本地验证」。终端和网页默认 300 全局轮（可配置 1–1000 轮）、每客户端每轮 1 个本地 epoch、batch size 16、SGD 学习率 0.03、τ=3、λ=0.6。低轮次只用于流程演示，不保证分类准确率。服务器耗时取决于 CPU、共享存储和排队情况。
 
@@ -154,21 +207,22 @@ system 的 Slurm 编辑器可参考下列脚本；`${id}` 是现有作业模块�
 set -euo pipefail
 # 改成三个计算节点均能访问的真实共享路径。
 export FEDSIMGH_PROJECT=/home/fedsimgh
-export FEDSIMGH_OUTPUT=/home/mec-share-dc/${id}/output/fedsimgh
+export FEDSIMGH_OUTPUT=${id}/output/fedsimgh
 export FEDSIMGH_ROUNDS=300
 exec bash "$FEDSIMGH_PROJECT/slurm/system.sbatch"
 ```
 
-`FEDSIMGH_PROJECT`、其 `.venv` 及 `FEDSIMGH_OUTPUT` 都必须在三节点间共享、路径一致。`/Users/patton/system/fedsimgh` 是本机开发路径，示例 `/home/fedsimgh` 是待部署的服务器路径，并非声称服务器已创建此目录。现有系统的其他算法即便各节点有同名目录，也不代表它们共享文件；本算法的每轮更新交换必须使用真实共享存储。
+上述示例为原有 `file` 模式，`FEDSIMGH_PROJECT`、其 `.venv` 及 `FEDSIMGH_OUTPUT` 都必须在三节点间共享、路径一致。`${id}` 由 system 替换为完整任务路径，不能再重复拼接 `/home/mec-share-dc/`。`/Users/patton/system/fedsimgh` 是本机开发路径，示例 `/home/fedsimgh` 是待部署的服务器路径，并非声称服务器已创建此目录。现有系统其他算法即便各节点有同名目录，也不代表共享文件；无共享挂载时请使用前述 TCP 方案。
 
 脚本支持 `FEDSIMGH_ROUNDS`、`FEDSIMGH_EPOCHS`、`FEDSIMGH_LR`、`FEDSIMGH_TAU`、`FEDSIMGH_HISTORY_LAMBDA`，以及 `FEDSIMGH_PYTHON` 指定实际 Python 解释器。结果位于 `FEDSIMGH_OUTPUT/<运行编号>/`。
 
-系统前端可用以下已有产物完成展示：
+系统前端可用以下产物完成展示：
 
 | 用途 | 数据来源 |
 | --- | --- |
 | 实时文本日志 | Slurm 作业标准日志、`console.log` |
 | 训练进度、准确率曲线、节点 | `state.json` |
+| 兼容现有曲线格式（从 0 起的轮次键） | `acc_data.json` / `loss_data.json` |
 | 聚合权重、历史相似度、逐条诊断事件 | `events.jsonl` |
 | 每条故障类别及概率 | `predictions.json` |
 | 下载诊断结果 / 模型 | `predictions.csv` / `model.pt` |
@@ -185,6 +239,8 @@ exec bash "$FEDSIMGH_PROJECT/slurm/system.sbatch"
 config.json         本次超参数
 submission.json     Slurm 作业号 / 本地进程信息
 state.json          训练状态、各轮评估、节点信息
+acc_data.json       每轮准确率，键从 0 开始
+loss_data.json      每轮三个客户端训练 loss 的均值，键从 0 开始
 events.jsonl        前端读取的结构化训练与逐条诊断日志
 rank-0.log          协调端及客户端 0 原始输出
 rank-1.log          客户端 1 原始输出
@@ -206,9 +262,9 @@ predictions.csv     便于下载的中文 CSV
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 node --check web/app.js   # Node 仅用于可选语法检查，部署运行不需要 Node
-bash -n scripts/setup.sh slurm/train.sbatch slurm/system.sbatch
+bash -n scripts/setup.sh slurm/train.sbatch slurm/system.sbatch slurm/tcp-tasks.sh
 ```
 
-测试涵盖投影的解析结果、EMA 按客户端保留、零更新、数据校验与训练/测试隔离、Slurm 提交/取消接口、已有资源分配时的 srun 启动与失败码传递，以及三个真实本地进程完成训练、保存后重新加载模型并核对全部 80 条预测。Slurm 命令测试使用模拟调度器；实际三台服务器上的调度需要在你的集群确认。
+测试涵盖投影的解析结果、EMA 按客户端保留、零更新、数据校验与训练/测试隔离、Slurm 提交/取消接口、已有资源分配时的两种 srun 启动与失败码传递，以及三个真实本地进程完成训练、保存后重新加载模型并核对全部 80 条预测。TCP 另外覆盖拆包/粘包、截断/超长帧、错误 token、重复客户端、过期轮次、参数校验、缺失节点超时、客户端崩溃、主动取消，并精确对照文件模式模型与预测。Slurm 命令测试使用模拟调度器；实际三台服务器上的调度需要在你的集群确认。
 
 算法改编来源：[`Patton0829/pfllib`](https://github.com/Patton0829/pfllib) 的 `system/flcore/servers/serversimghhistnosize.py`。代码许可和来源保留见 `LICENSE`、`NOTICE`。
