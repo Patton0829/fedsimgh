@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,42 @@ class DatasetTests(unittest.TestCase):
 
 
 class SlurmControlTests(unittest.TestCase):
+    def test_system_launcher_uses_existing_allocation_and_propagates_failure(self):
+        with tempfile.TemporaryDirectory(prefix="fedsimgh allocated ") as temp:
+            root = Path(temp)
+            launcher = root / "srun"
+            launcher.write_text(f"#!{sys.executable}\n" + '''import json, os, pathlib, sys
+if os.environ.get("FEDSIMGH_TEST_FAIL"):
+    raise SystemExit(7)
+run = pathlib.Path(sys.argv[sys.argv.index("--run-dir") + 1])
+config = json.loads((run / "config.json").read_text())
+assert config["mode"] == "slurm" and config["rounds"] == 300
+assert "--kill-on-bad-exit=1" in sys.argv
+(run / "state.json").write_text(json.dumps({"status": "completed", "final_metrics": {"accuracy": .7, "macro_f1": .7}}))
+print("Mock existing-allocation launcher finished")
+''')
+            launcher.chmod(0o755)
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                   "FEDSIMGH_PROJECT": str(ROOT), "FEDSIMGH_OUTPUT": str(root / "output"),
+                   "FEDSIMGH_PYTHON": sys.executable, "FEDSIMGH_ROUNDS": "300",
+                   "SLURM_NTASKS": "3", "SLURM_JOB_NUM_NODES": "3",
+                   "SLURM_CPUS_PER_TASK": "1", "SLURM_JOB_ID": "12345"}
+            result = subprocess.run(["bash", str(ROOT / "slurm/system.sbatch")],
+                                    env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Final accuracy: 70.0%", result.stdout)
+            config_paths = list((root / "output").glob("*/config.json"))
+            self.assertEqual(len(config_paths), 1)
+            self.assertEqual(read_json(config_paths[0])["rounds"], 300)
+            result = subprocess.run(["bash", str(ROOT / "slurm/system.sbatch")],
+                                    env={**env, "FEDSIMGH_TEST_FAIL": "1"},
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 7)
+            result = subprocess.run(["bash", str(ROOT / "slurm/system.sbatch")],
+                                    env={**env, "SLURM_JOB_NUM_NODES": "2"},
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 2)
+
     def test_slurm_submission_queue_and_cancellation(self):
         with tempfile.TemporaryDirectory() as temp:
             control = ControlPlane(temp, "slurm", threads=2)

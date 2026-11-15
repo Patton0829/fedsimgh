@@ -33,7 +33,7 @@ def finish_local_workers(control, run_id):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="终端运行三客户端 CPU 联邦训练，并输出每条信号的故障类别")
     parser.add_argument("--mode", choices=["local", "slurm"], default="local")
-    parser.add_argument("--rounds", type=int, default=100, help="全局训练轮次，1–1000，默认 100")
+    parser.add_argument("--rounds", type=int, default=300, help="全局训练轮次，1–1000，默认 300")
     parser.add_argument("--epochs", type=int, default=1, help="每客户端每轮本地 epoch，1–3")
     parser.add_argument("--threads", type=int, choices=range(1, 9), default=1, help="每客户端 CPU 线程数")
     parser.add_argument("--lr", type=float, default=.03)

@@ -4,6 +4,35 @@
 
 保留 PFLlib `FedSimGHHistNoSize` 的冲突投影、协调后方向的历史相似度 EMA、相似度加权聚合和不按样本量加权的行为。诊断网络改为轻量 1D CNN，并用 GroupNorm 替代 BatchNorm，避免导出模型缺少客户端运行统计量。此项目演示算法流程，不复现论文的完整模型规模和实验指标。
 
+## 算法介绍
+
+**算法名称：基于历史相似度引导的梯度协调联邦故障诊断算法。实现标识：`FedSimGHHistNoSize`。**
+
+算法面向多个客户端的工况和故障类别分布不同、模型更新方向相互冲突的问题。在每轮联邦训练中，各客户端接收全局模型，使用各自训练分片进行本地优化。协调端根据上传的模型更新检测方向冲突，通过投影减少相互抵消，再综合当前与历史的一致性，为各客户端分配聚合权重并更新全局模型。训练完成后，全局模型对振动信号窗口输出故障类别及各类别概率。
+
+本实现依次执行：
+
+1. **计算模型更新**：`Δ_i = θ_i - θ_global`。这里协调的对象是本地训练后的参数差，而非直接上传某个 mini-batch 的梯度。
+2. **协调冲突方向**：当两个原始更新的余弦相似度小于 0 时，以原始更新为投影参考，按代码中的成对顺序去除冲突分量，得到 `Δ̃_i`。
+3. **计算一致性**：把协调后的更新单位化，构建单位方向和的共识方向 `c`，计算 `s_i = cosine(Δ̃_i, c)`。
+4. **平滑历史相似度**：`h_i(t) = λ·h_i(t-1) + (1-λ)·s_i(t)`；首次参与时以当前相似度初始化。
+5. **加权聚合**：`w_i = softmax(τ·h_i)`，再令 `θ_global ← θ_global + Σ w_i·Δ̃_i`。最终聚合保留更新的幅度，不按样本量再次加权。
+
+当前任务是 HUST 轴承振动四分类：0 正常、1 内圈故障、2 外圈故障、3 滚动体故障。输入为单通道 2048 点窗口，经逐窗口标准化后进入轻量 CNN。预测输出为样本编号、故障类别、四类概率；演示测试集有真实标签，因此还输出是否预测正确。`confidence` 表示模型概率，不等于诊断准确率。
+
+此模型的类别语义来自 HUST 轴承数据。若接入 system 中的转辙机或其他设备数据，需要相应的数据预处理、标签映射和重新训练，不能直接套用现有四分类权重。
+
+## 本机 system 目录
+
+仓库已迁至 `/Users/patton/system/fedsimgh`，包含原 `.git`、数据、虚拟环境和已有训练记录；原 `/Users/patton/fl/fedsimgh` 已迁出。终端运行：
+
+```bash
+cd /Users/patton/system/fedsimgh
+.venv/bin/python -u train.py --rounds 300 --threads 1
+```
+
+终端、网页和 system 作业脚本均以 300 轮为默认值。Linux 服务器应在其实际共享目录重新运行 `scripts/setup.sh` 创建本机 Python 环境，不能把 macOS 的 `.venv` 直接用于 Linux。
+
 ## 三节点部署
 
 前提：Linux、推荐 Python 3.11、三个 CPU 计算节点；**仓库、虚拟环境和 `runtime/` 必须位于所有节点相同路径的共享目录**。Web 进程运行在允许长期启动轻量服务且可以调用 `sbatch/squeue/scancel` 的主机上。计算由 Slurm 作业完成，Web 进程不加载 PyTorch、不在登录节点训练。
@@ -75,10 +104,10 @@ Slurm 脚本在 [`slurm/train.sbatch`](slurm/train.sbatch)：固定 `3 nodes × 
 
 `data/manifest.json` 记录随机种子、类别、上游文件/样本索引、原划分策略和 NPZ 校验值。NPZ 仅包含普通数值数组，运行时 `allow_pickle=False`。数据来源说明见 [`data/README.md`](data/README.md)。
 
-如需从原仓库重新抽样：
+如需从原仓库重新抽样，本机 PFLlib 数据仍位于下列目录；服务器按原数据实际位置调整：
 
 ```bash
-.venv/bin/python scripts/prepare_data.py --source ../pfllib/dataset/hust
+.venv/bin/python scripts/prepare_data.py --source /Users/patton/fl/pfllib/dataset/hust
 ```
 
 ## 没有 Slurm 时本地验证
@@ -86,7 +115,7 @@ Slurm 脚本在 [`slurm/train.sbatch`](slurm/train.sbatch)：固定 `3 nodes × 
 直接在终端训练并逐条输出故障诊断（不启动网页、不占用端口）：
 
 ```bash
-.venv/bin/python -u train.py --rounds 100 --threads 1
+.venv/bin/python -u train.py --rounds 300 --threads 1
 ```
 
 终端实时打印每轮训练 loss、冲突投影次数、历史相似度权重和准确率，随后打印全部 80 条信号的预测故障类别、概率、真实类别和正确与否。最后显示 `predictions.csv` 和 `model.pt` 的完整路径。默认产物存于 `runtime/terminal/<任务编号>/`，与网页任务分开；按 `Ctrl+C` 停止本次任务。可通过 `--epochs`、`--lr`、`--tau`、`--history-lambda` 调整参数。
@@ -101,7 +130,52 @@ Slurm 脚本在 [`slurm/train.sbatch`](slurm/train.sbatch)：固定 `3 nodes × 
 
 若提示 `Address already in use`，说明端口已被占用，可改用 `--port 8001`；终端入口没有端口要求。
 
-这个模式启动三个独立 CPU 进程，使用与 Slurm 完全相同的 worker、聚合器和文件协议；仅用于验证，页面会标明「本地验证」。终端和网页默认 100 全局轮（可配置 1–1000 轮）、每客户端每轮 1 个本地 epoch、batch size 16、SGD 学习率 0.03、τ=3、λ=0.6。低轮次只用于流程演示，不保证分类准确率。服务器耗时取决于 CPU、共享存储和排队情况。
+这个模式启动三个独立 CPU 进程，使用与 Slurm 完全相同的 worker、聚合器和文件协议；仅用于验证，页面会标明「本地验证」。终端和网页默认 300 全局轮（可配置 1–1000 轮）、每客户端每轮 1 个本地 epoch、batch size 16、SGD 学习率 0.03、τ=3、λ=0.6。低轮次只用于流程演示，不保证分类准确率。服务器耗时取决于 CPU、共享存储和排队情况。
+
+## 接入 system 的作业模块
+
+本机 `control-center-be` 的作业模块已有 `sbatch` 提交流程，`control-center-fe` 也已有 Slurm 脚本编辑和模板入口。因此接入时可继续使用现有作业管理，无需再启动本项目的独立网页。这里提供部署脚本和接口说明，尚未修改 system 前后端、数据库或在真实集群提交任务。
+
+**已有 Slurm 分配时使用 [`slurm/system.sbatch`](slurm/system.sbatch)。** 它直接执行 `srun` 启动三个客户端，将日志写入外层作业的标准输出，同时保存结构化结果。这个场景不要调用 `train.py --mode slurm`，因为后者会再次调用 `sbatch`，产生嵌套资源申请。
+
+system 的 Slurm 编辑器可参考下列脚本；`${id}` 是现有作业模块替换的任务目录占位符：
+
+```bash
+#!/usr/bin/env bash
+#SBATCH --job-name=fedsimgh
+#SBATCH --nodes=3
+#SBATCH --ntasks=3
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=2G
+#SBATCH --time=00:20:00
+#SBATCH --output=${id}/output/%j.log
+
+set -euo pipefail
+# 改成三个计算节点均能访问的真实共享路径。
+export FEDSIMGH_PROJECT=/home/fedsimgh
+export FEDSIMGH_OUTPUT=/home/mec-share-dc/${id}/output/fedsimgh
+export FEDSIMGH_ROUNDS=300
+exec bash "$FEDSIMGH_PROJECT/slurm/system.sbatch"
+```
+
+`FEDSIMGH_PROJECT`、其 `.venv` 及 `FEDSIMGH_OUTPUT` 都必须在三节点间共享、路径一致。`/Users/patton/system/fedsimgh` 是本机开发路径，示例 `/home/fedsimgh` 是待部署的服务器路径，并非声称服务器已创建此目录。现有系统的其他算法即便各节点有同名目录，也不代表它们共享文件；本算法的每轮更新交换必须使用真实共享存储。
+
+脚本支持 `FEDSIMGH_ROUNDS`、`FEDSIMGH_EPOCHS`、`FEDSIMGH_LR`、`FEDSIMGH_TAU`、`FEDSIMGH_HISTORY_LAMBDA`，以及 `FEDSIMGH_PYTHON` 指定实际 Python 解释器。结果位于 `FEDSIMGH_OUTPUT/<运行编号>/`。
+
+系统前端可用以下已有产物完成展示：
+
+| 用途 | 数据来源 |
+| --- | --- |
+| 实时文本日志 | Slurm 作业标准日志、`console.log` |
+| 训练进度、准确率曲线、节点 | `state.json` |
+| 聚合权重、历史相似度、逐条诊断事件 | `events.jsonl` |
+| 每条故障类别及概率 | `predictions.json` |
+| 下载诊断结果 / 模型 | `predictions.csv` / `model.pt` |
+
+若采用独立算法服务，由 system 后端转发本项目的 `POST /api/runs`、`GET /api/state?run=<运行编号>&offset=<日志字节偏移>`、`POST /api/runs/<运行编号>/stop` 即可；已有作业调度与独立算法服务应选择一个作为训练资源申请入口。
+
+仅使用本机或控制节点终端提交 Slurm 作业时，可执行 `.venv/bin/python -u train.py --mode slurm --rounds 300 --threads 2`。此命令由本项目自行申请三节点，适用于未由 system 预先分配资源的情况。
 
 ## 输出和排错
 
@@ -132,9 +206,9 @@ predictions.csv     便于下载的中文 CSV
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 node --check web/app.js   # Node 仅用于可选语法检查，部署运行不需要 Node
-bash -n scripts/setup.sh slurm/train.sbatch
+bash -n scripts/setup.sh slurm/train.sbatch slurm/system.sbatch
 ```
 
-测试涵盖投影的解析结果、EMA 按客户端保留、零更新、数据校验与训练/测试隔离、Slurm 提交/取消接口，以及三个真实本地进程完成训练、保存后重新加载模型并核对全部 80 条预测。Slurm 命令测试使用模拟调度器；实际三台服务器上的调度需要在你的集群确认。
+测试涵盖投影的解析结果、EMA 按客户端保留、零更新、数据校验与训练/测试隔离、Slurm 提交/取消接口、已有资源分配时的 srun 启动与失败码传递，以及三个真实本地进程完成训练、保存后重新加载模型并核对全部 80 条预测。Slurm 命令测试使用模拟调度器；实际三台服务器上的调度需要在你的集群确认。
 
 算法改编来源：[`Patton0829/pfllib`](https://github.com/Patton0829/pfllib) 的 `system/flcore/servers/serversimghhistnosize.py`。代码许可和来源保留见 `LICENSE`、`NOTICE`。
