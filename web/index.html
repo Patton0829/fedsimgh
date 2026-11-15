@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FaultDiag · 三节点联邦故障诊断</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="FaultDiag 首页"><span class="brand-icon">F<span>↗</span></span><span>FaultDiag<small>FEDERATED LAB</small></span></a>
+    <div class="nav-label">实验工作台</div>
+    <a href="#overview" class="nav-item selected"><span>◫</span> 运行概览</a>
+    <a href="#diagnosis" class="nav-item"><span>⌁</span> 逐条诊断</a>
+    <a href="#logs" class="nav-item"><span>≡</span> 实时日志</a>
+    <div class="sidebar-bottom"><span class="pulse"></span> CPU ONLY <span class="divider">/</span> 3 NODES<p>历史相似度引导<br>梯度协调联邦故障诊断</p><span class="version">FedSimGHHistNoSize · Demo</span></div>
+  </aside>
+  <main id="overview">
+    <header><div class="breadcrumb">实验工作台 <span>/</span> 联邦故障诊断</div><div class="environment"><span class="dot"></span><span id="mode-label">正在连接</span></div></header>
+    <div class="page-heading"><div><div class="eyebrow">FEDERATED FAULT DIAGNOSIS</div><h1>从协同训练，到逐条诊断<span>。</span></h1><p>三个计算节点，一份协调后的全局模型。观察训练过程，查看每条信号的故障类别。</p></div><div id="run-badge" class="status-badge idle">等待开始</div></div>
+    <div id="notice" role="alert" class="notice hidden"></div>
+    <section class="stats" aria-label="运行指标">
+      <article class="stat"><span>计算节点 <span class="stat-icon">▧</span></span><strong>03<small>节点</small></strong><p>每节点 1 个客户端 · 节点 0 聚合</p></article>
+      <article class="stat"><span>轻量数据集 <span class="stat-icon">▤</span></span><strong>368<small>条信号</small></strong><p>288 训练 / 80 测试 · HUST 四分类</p></article>
+      <article class="stat"><span>当前训练轮次 <span class="stat-icon">↻</span></span><strong id="round-value">00<small>/ 20 轮</small></strong><p id="elapsed-value">CPU 执行 · 尚未开始</p></article>
+      <article class="stat accent-stat"><span>演示测试集准确率 <span class="stat-icon">◎</span></span><strong id="accuracy-value">—<small>%</small></strong><p id="f1-value">等待模型评估</p></article>
+    </section>
+    <section class="workspace-grid">
+      <article class="card config-card"><div class="card-title"><div><span class="section-index">01</span><h2>训练配置</h2></div><span class="subtle">CPU 联邦模拟</span></div>
+        <form id="train-form">
+          <div class="algorithm-label">聚合算法<span>FedSimGHHistNoSize</span></div>
+          <div class="form-grid">
+            <label>全局轮次<input id="rounds" type="number" min="1" max="60" value="20" required></label>
+            <label>本地训练轮次<input id="epochs" type="number" min="1" max="3" value="1" required></label>
+            <label>学习率<input id="lr" type="number" min="0.0001" max="0.2" step="0.0001" value="0.03" required></label>
+            <label>相似度系数 τ<input id="tau" type="number" min="0.1" max="10" step="0.1" value="3.0" required></label>
+          </div>
+          <label class="range-label">历史平滑系数 λ <output id="lambda-value">0.60</output><input id="history-lambda" type="range" min="0" max="0.99" step="0.01" value="0.6"></label>
+          <div class="config-note"><span>ⓘ</span><p>完整保留历史相似度加权与梯度冲突投影，采用轻量 CNN 适配 CPU。每次训练后自动诊断全部测试信号。</p></div>
+          <div class="actions"><button type="submit" id="start-button" class="primary">▶ <span>开始训练与诊断</span></button><button type="button" id="stop-button" class="secondary" disabled>停止</button></div>
+        </form>
+      </article>
+      <article class="card training-card"><div class="card-title"><div><span class="section-index">02</span><h2>节点与训练趋势</h2></div><span id="job-label" class="mono subtle">JOB —</span></div>
+        <div class="nodes" id="nodes"></div>
+        <div class="chart-heading"><span>测试集准确率</span><span class="chart-legend"><i></i> 全局模型</span></div>
+        <div class="chart" id="chart"><div class="chart-empty">提交任务后，训练趋势将在这里更新</div></div>
+        <div class="progress-heading"><span id="progress-label">等待启动</span><span id="progress-percent">0%</span></div><div class="progress-track"><div id="progress-bar"></div></div>
+        <p id="scheduler-message" class="scheduler-message">Slurm：3 节点 × 1 任务，无需 GPU。</p>
+      </article>
+    </section>
+    <section class="card diagnosis-card" id="diagnosis"><div class="card-title"><div><span class="section-index">03</span><h2>逐条故障诊断</h2><span class="count-tag" id="prediction-count">0 / 80</span></div><a id="csv-download" class="text-link disabled" aria-disabled="true">↓ 导出 CSV</a></div>
+      <div class="diagnosis-toolbar"><p>独立测试信号 · 每条 2,048 个采样点 <span>点击一行查看波形与类别概率</span></p><label class="filter-label">筛选结果<select id="result-filter"><option value="all">全部样本</option><option value="wrong">仅预测错误</option><option value="0">正常</option><option value="1">内圈故障</option><option value="2">外圈故障</option><option value="3">滚动体故障</option></select></label></div>
+      <div class="diagnosis-layout"><div class="table-wrap"><table><thead><tr><th>样本编号</th><th>真实类别</th><th>预测类别</th><th>预测概率</th><th>结果</th></tr></thead><tbody id="prediction-body"></tbody></table><div class="pagination"><span id="page-summary">共 80 条测试样本</span><div><button id="prev-page" class="page-button" aria-label="上一页">←</button><span id="page-number">1 / 8</span><button id="next-page" class="page-button" aria-label="下一页">→</button></div></div></div>
+      <aside class="signal-detail"><div class="signal-title"><span id="selected-sample">SIGNAL / 000</span><span class="signal-live">2,048 PTS</span></div><svg id="waveform" viewBox="0 0 360 100" role="img" aria-label="选中样本的振动信号波形"></svg><div class="signal-result"><span>诊断结果</span><strong id="selected-result">等待模型预测</strong></div><div id="probabilities" class="probabilities"></div><p class="probability-note">预测概率反映模型输出，不等于诊断正确率。当前演示仅识别四种已知类别。</p></aside></div>
+    </section>
+    <section class="card logs-card" id="logs"><div class="card-title"><div><span class="section-index">04</span><h2>实时运行日志</h2><span class="live-tag"><i></i> LIVE</span></div><div class="log-actions"><label><input type="checkbox" id="auto-scroll" checked> 自动滚动</label><a id="logs-download" class="text-link disabled" aria-disabled="true">↓ 下载日志</a></div></div><div class="terminal-bar"><span><i></i><i></i><i></i></span><span id="terminal-title">faultdiag / awaiting-job</span><span>CPU</span></div><div id="log-output" class="terminal" role="log" aria-label="训练与诊断日志"><div class="log-placeholder">欢迎使用 FaultDiag。配置参数并开始任务，日志将在此实时更新。</div></div></section>
+    <footer><span>FaultDiag <b>·</b> 历史相似度引导的梯度协调联邦故障诊断</span><span>HUST SUBSET · CPU · THREE CLIENTS</span></footer>
+  </main>
+</body>
+</html>

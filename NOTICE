@@ -1,0 +1,11 @@
+FaultDiag CPU Demo
+
+The historical similarity guided gradient coordination aggregation in
+faultdemo/core.py is adapted from:
+https://github.com/Patton0829/pfllib
+system/flcore/servers/serversimghhistnosize.py
+
+The upstream PFLlib code is distributed under the Apache License, Version 2.0.
+The aggregation has been extracted into a standalone component. The backbone,
+Slurm/shared-filesystem runtime, control plane and frontend are demo adaptations.
+See LICENSE for the upstream code license. See data/README.md for data provenance.
