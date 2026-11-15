@@ -86,7 +86,7 @@ Slurm 脚本在 [`slurm/train.sbatch`](slurm/train.sbatch)：固定 `3 nodes × 
 直接在终端训练并逐条输出故障诊断（不启动网页、不占用端口）：
 
 ```bash
-.venv/bin/python -u train.py --rounds 20 --threads 1
+.venv/bin/python -u train.py --rounds 100 --threads 1
 ```
 
 终端实时打印每轮训练 loss、冲突投影次数、历史相似度权重和准确率，随后打印全部 80 条信号的预测故障类别、概率、真实类别和正确与否。最后显示 `predictions.csv` 和 `model.pt` 的完整路径。默认产物存于 `runtime/terminal/<任务编号>/`，与网页任务分开；按 `Ctrl+C` 停止本次任务。可通过 `--epochs`、`--lr`、`--tau`、`--history-lambda` 调整参数。
@@ -101,7 +101,7 @@ Slurm 脚本在 [`slurm/train.sbatch`](slurm/train.sbatch)：固定 `3 nodes × 
 
 若提示 `Address already in use`，说明端口已被占用，可改用 `--port 8001`；终端入口没有端口要求。
 
-这个模式启动三个独立 CPU 进程，使用与 Slurm 完全相同的 worker、聚合器和文件协议；仅用于验证，页面会标明「本地验证」。默认 20 全局轮、每客户端每轮 1 个本地 epoch、batch size 16、SGD 学习率 0.03、τ=3、λ=0.6。低轮次只用于流程演示，不保证分类准确率。服务器耗时取决于 CPU、共享存储和排队情况。
+这个模式启动三个独立 CPU 进程，使用与 Slurm 完全相同的 worker、聚合器和文件协议；仅用于验证，页面会标明「本地验证」。终端和网页默认 100 全局轮（可配置 1–1000 轮）、每客户端每轮 1 个本地 epoch、batch size 16、SGD 学习率 0.03、τ=3、λ=0.6。低轮次只用于流程演示，不保证分类准确率。服务器耗时取决于 CPU、共享存储和排队情况。
 
 ## 输出和排错
 

@@ -107,7 +107,7 @@ class SlurmControlTests(unittest.TestCase):
     def test_invalid_options_and_run_paths(self):
         with tempfile.TemporaryDirectory() as temp:
             control = ControlPlane(temp, "local")
-            for options in [{"rounds": 0}, {"lr": float("nan")}, {"rounds": True}, {"rounds": 1.5}]:
+            for options in [{"rounds": 0}, {"rounds": 1001}, {"lr": float("nan")}, {"rounds": True}, {"rounds": 1.5}]:
                 with self.assertRaises(ValueError):
                     control.start(options)
             with self.assertRaises(ValueError):

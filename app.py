@@ -128,7 +128,7 @@ class ControlPlane:
                     raise RuntimeError("已有任务正在排队或运行，请先停止或等待完成。")
             if self.mode == "slurm" and not shutil.which("sbatch"):
                 raise ValueError("未找到 sbatch。请在可提交 Slurm 作业的主机启动，或用 --mode local 本地验证。")
-            limits = {"rounds": (1, 60, 20), "epochs": (1, 3, 1)}
+            limits = {"rounds": (1, 1000, 100), "epochs": (1, 3, 1)}
             config = {"mode": self.mode}
             for key, (low, high, default) in limits.items():
                 value = options.get(key, default)
