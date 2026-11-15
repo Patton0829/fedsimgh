@@ -1,4 +1,4 @@
-# FaultDiag CPU Demo
+# FedSimGH · 三节点 CPU 故障诊断 Demo
 
 基于历史相似度引导的梯度协调联邦故障诊断最小演示。**纯 CPU、三个 Slurm 计算节点、约 2.9 MiB 数据**，浏览器显示训练日志，以及每条测试信号的故障类别。
 
@@ -20,8 +20,8 @@
 在共享目录执行：
 
 ```bash
-git clone https://github.com/Patton0829/faultdiag-cpu-demo.git
-cd faultdiag-cpu-demo
+git clone https://github.com/Patton0829/fedsimgh.git
+cd fedsimgh
 
 # 如果默认 python3 不是所需版本，可指定 PYTHON_BIN=python3.11。
 bash scripts/setup.sh
@@ -34,7 +34,7 @@ export SLURM_PARTITION=cpu
 .venv/bin/python app.py --mode slurm --host 127.0.0.1 --port 8000
 ```
 
-默认仓库为私有；clone 时使用你已有的 GitHub SSH key、`gh auth login` 或 Git 凭据。不要将令牌写到仓库或启动命令里。也可使用 SSH 地址 `git@github.com:Patton0829/faultdiag-cpu-demo.git`。
+仓库也支持 SSH 地址 `git@github.com:Patton0829/fedsimgh.git`；HTTPS 拉取公开仓库无需登录 GitHub。
 
 在自己电脑另开终端，转发 Web 端口：
 
